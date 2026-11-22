@@ -1,0 +1,25 @@
+// Reconstructed draft, 2026-11-22. Original conversation download unavailable.
+// MYDFIR VPN-driven simulation context; not production validated.
+// Hypothesis: successful interactive sign-ins from >=2 countries in a rolling hour.
+// Geographic diversity is a triage signal, not proof of compromise or impossible travel.
+let Lookback = 1h;
+let MinimumCountries = 2;
+let ExcludedUsers = dynamic([]); // Lowercase UPNs; keep real values out of public Git.
+let ExcludedIPs = dynamic([]); // Exact IP matches only; not CIDR ranges.
+SigninLogs
+| where TimeGenerated >= ago(Lookback)
+| where ResultType == "0" and IsInteractive == true
+| extend Country = toupper(tostring(Location)), Account = tolower(UserPrincipalName)
+| where isnotempty(Account) and isnotempty(Country)
+| where not(set_has_element(ExcludedUsers, Account))
+| where not(set_has_element(ExcludedIPs, IPAddress))
+| summarize FirstSeen=min(TimeGenerated), TimeGenerated=max(TimeGenerated),
+    Countries=make_set(Country, 256), IPAddresses=make_set(IPAddress, 256),
+    Applications=make_set(AppDisplayName, 256), EventCount=count()
+    by Account
+| extend CountryCount=array_length(Countries)
+| where CountryCount >= MinimumCountries
+| extend AccountName=tostring(split(Account, "@")[0]),
+    UPNSuffix=tostring(split(Account, "@")[1])
+| project TimeGenerated, FirstSeen, Account, AccountName, UPNSuffix,
+    CountryCount, Countries, IPAddresses, Applications, EventCount

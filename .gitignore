@@ -1,0 +1,7 @@
+# Keep sensitive evidence and local deployment configuration out of Git.
+private/
+raw-evidence/
+.env
+.env.*
+*.log
+.DS_Store
