@@ -1,195 +1,184 @@
-# Microsoft Entra ID — Geographical Sign-in Detection
+# Microsoft Entra ID — Impossible Travel Detection
 
 **Focus:** Identity threat detection and investigation  
 **Platform:** Microsoft Sentinel / Log Analytics · Microsoft Entra ID  
-**Data source:** `SigninLogs`  
-**Exercise context:** MYDFIR VPN-driven simulations
+**Data source:** `SigninLogs`
 
 ## Overview
 
-This project documents a KQL query that identifies consecutive successful sign-ins for the same account where the source IP changes and the implied travel speed exceeds **900 km/h** over a distance of at least **200 km**.
+This detection identifies consecutive successful sign-ins for the same account where the source IP changes and the implied travel speed exceeds **900 km/h** over a distance of at least **200 km**. It provides both events, calculated distance and speed, and authentication and device context so analysts can assess the activity and investigate possible account compromise.
 
-The purpose is to give analysts a practical starting point for investigating potentially unauthorised account use. The query brings both sign-in times, source IPs and country codes into one result, alongside device and authentication context for the later event. Analysts can then reconstruct what happened and distinguish suspicious access from VPN routing, proxies or other legitimate explanations.
+“Impossible travel” describes an implausible change between IP-derived locations. It does not establish the user's physical location. VPNs, proxies and mobile-network routing can produce the same signal as unauthorised account use, so each result requires investigation.
 
-**A result is an investigation lead, not proof of compromise.** The exercise context is MYDFIR VPN-driven simulation: changes in VPN exit location can deliberately generate this pattern without physical travel. No production validation or measured detection effectiveness is claimed.
+[Open the detection query](impossible_travel.kql)
 
-[Open the KQL query](geographical_signin_detection.kql)
+## Detection logic
 
-## Detection hypothesis
-
-If the same account successfully signs in from two geographically distant IP addresses within a short interval, the implied travel speed may be inconsistent with ordinary physical movement. This can indicate credential or session misuse, but it can also reflect the location of network infrastructure rather than the user.
-
-The distance threshold reduces matches caused by smaller geographic shifts. The speed threshold prioritises rapid changes. These are investigation thresholds in the supplied query, not empirically established boundaries between benign and malicious activity.
-
-## KQL query
-
-The query below is preserved as supplied, including its two commented-out filters.
-
-```kusto
-SigninLogs
-| where ResultType == "0"
-| extend User = UserPrincipalName
-| extend ManagedDevice = tostring(DeviceDetail.isManaged)
-| extend Device = tostring(DeviceDetail.operatingSystem)
-| extend Latitude = todouble(LocationDetails.geoCoordinates.latitude)
-| extend Longitude = todouble(LocationDetails.geoCoordinates.longitude)
-//| where isnotnull(Latitude) and isnotnull(Longitude)
-| sort by User asc, TimeGenerated asc
-| serialize
-| extend PreviousUser = prev(User),PreviousTime = prev(TimeGenerated),PreviousIP = prev(IPAddress),PreviousLocation = prev(Location),PreviousLatitude = prev(Latitude),PreviousLongitude = prev(Longitude)
-| where User == PreviousUser
-//| where PreviousLocation != Location
-| extend TimeDifferenceHours =todouble(datetime_diff("second", TimeGenerated, PreviousTime)) / 3600.0
-| where TimeDifferenceHours > 0
-| extend DistanceKm = geo_distance_2points(PreviousLongitude,PreviousLatitude,Longitude,Latitude) / 1000.0
-| extend TravelSpeedKmh = DistanceKm / TimeDifferenceHours
-| where PreviousIP != IPAddress
-| where TravelSpeedKmh > 900
-| where DistanceKm >= 200
-| project TimeGenerated, User,PreviousTime, PreviousIP, IPAddress,PreviousLocation, Location,Device, ManagedDevice, AuthenticationDetails
-| sort by TimeGenerated asc
-```
-
-## How the query works
-
-| Stage | Logic | Why it matters |
+| Stage | Implementation | Operational purpose |
 | --- | --- | --- |
-| Select successful events | `ResultType == "0"` | Focuses on successful sign-ins. Failed attempts remain relevant during investigation but do not form the pairs here. |
-| Extract context | Copies the UPN to `User`; extracts operating system, managed-device state and numeric coordinates | Prepares the location calculation and adds context for triage. Device state is not used to suppress results. |
-| Order the events | Sorts by `User`, then `TimeGenerated`; serializes the result | Makes the preceding row available for a chronological comparison. `serialize` does not itself sort data. |
-| Build pairs | Uses `prev()` for the preceding account, time, IP, country and coordinates | Compares adjacent successful sign-ins in the selected data, rather than every possible pair. |
-| Keep the same account | `User == PreviousUser` | Removes the cross-account pair created at each account boundary. |
-| Calculate elapsed time | Converts the second-based difference between timestamps into hours; requires a positive value | Excludes zero/negative intervals and avoids division by zero. |
-| Calculate distance and speed | Converts geospatial distance from metres to kilometres; divides by elapsed hours | Produces an implied speed between the two IP-derived locations. |
-| Apply thresholds | Different source IP, speed **>900 km/h**, distance **≥200 km** | Returns only pairs satisfying all three conditions. Exactly 900 km/h is excluded; exactly 200 km is included if the other conditions pass. |
-| Present results | Projects the investigation fields and sorts oldest first | Supports chronological review of the candidate pairs. |
+| Bound the search | Read the last 24 hours; compare pairs no more than 12 hours apart | Supplies predecessor context while limiting scan size. These are configurable starting settings. |
+| Select events | Successful sign-ins; interactive only by default | Focuses on user-driven authentication. Set `InteractiveOnly=false` to include other successful rows available in this table; separate tables are not added. |
+| Validate data | Require directory, account and sign-in IDs, source IP, ingestion time and valid coordinate ranges | Avoids pairing unidentified accounts or calculating from unusable coordinates. Monitor excluded telemetry separately. |
+| Deduplicate | Keep the latest ingested record per directory, account and sign-in ID | Prevents duplicate source records forming artificial pairs in the evaluated data. |
+| Order and pair | Sort by directory, account object ID, event time and sign-in ID; use `prev()` | Compares consecutive qualifying events within the same directory/account. The sign-in ID provides deterministic ordering for tied times. |
+| Select fresh pairs | At least one event was ingested during the last 15 minutes | Retains older context while allowing a late-arriving predecessor or successor to produce a result. |
+| Calculate speed | Shortest geospatial distance in kilometres divided by elapsed hours | Uses sign-in initiation time (`CreatedDateTime`), falling back to `TimeGenerated`; direct timespan arithmetic retains sub-second precision. |
+| Apply thresholds | Different IP, distance ≥200 km, speed >900 km/h, positive interval | Preserves the original distance and speed thresholds. Same-country pairs remain eligible. |
+| Return evidence | Both sign-in IDs, both device/authentication records, distance, speed and `PairId` | Supports reproducible triage and downstream handling of repeated pairs. |
 
-The country-change filter is commented out, so **same-country pairs can match**. This matters in geographically large countries. The explicit coordinate filter is also commented out: invalid or missing coordinates normally yield a null distance and do not pass the numeric thresholds. They are a coverage gap, not a benign finding.
+The query compares adjacent **qualifying** events, not all possible combinations. Filtering missing coordinates or non-interactive events changes which events become neighbours. Equal event times are excluded because a travel speed cannot be calculated from a zero interval.
 
-### Illustrative calculation
+### Example calculation
 
-Two successful sign-ins appear 600 km apart, 20 minutes apart, with different IP addresses:
+If two sign-ins are 600 km apart and 20 minutes apart:
 
-`600 km ÷ (20 / 60 hours) = 1,800 km/h`
+`600 ÷ (20 / 60) = 1,800 km/h`
 
-This satisfies both thresholds. It illustrates the calculation only; it is not an observed MYDFIR result or evidence of physical travel.
+With different IP addresses, that pair meets both thresholds. This is an illustrative calculation, not a measured deployment outcome.
 
-## Running the query and reading its output
+## Query parameters
 
-Use a workspace where Entra sign-in events are available in `SigninLogs`. Select the investigation time range explicitly in the query interface before running it. The supplied query contains **no explicit time filter**, so the interface's time scope matters. Both events must fall inside the queried data; a preceding event outside that scope cannot be paired.
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `RuleFrequency` | `15m` | Fresh ingestion window; match the scheduled rule interval. |
+| `HistoryWindow` | `24h` | Bounds both the event-time context and `TimeGenerated` scan. |
+| `MaxPairGap` | `12h` | Maximum elapsed time between compared events. |
+| `MinimumDistanceKm` | `200.0` | Inclusive minimum separation. |
+| `MinimumSpeedKmh` | `900.0` | Exclusive minimum implied speed. |
+| `InteractiveOnly` | `true` | Limits the source rows to interactive sign-ins by default. |
 
-| Output | Analyst interpretation |
-| --- | --- |
-| `TimeGenerated`, `PreviousTime` | Later and earlier event times used in the comparison |
-| `User` | Account whose adjacent successful sign-ins matched |
-| `PreviousIP`, `IPAddress` | Earlier and later source addresses; investigate both |
-| `PreviousLocation`, `Location` | Earlier and later country codes from `Location`, not precise physical positions |
-| `Device` | Operating system reported for the later sign-in; not a unique device identifier |
-| `ManagedDevice` | Managed-device value converted to text for the later sign-in; blank does not establish that a device is unmanaged |
-| `AuthenticationDetails` | Authentication-step details for the later sign-in; compare with the earlier event before concluding how authentication occurred |
+Keep the history window large enough for the maximum pair gap, measured ingestion latency and rule interval. The defaults provide headroom but do not guarantee coverage for every delay. No tenant-specific allowlists or identifiers are embedded in the query.
 
-The final projection omits the calculated distance and speed. For investigation, replace that projection in a **working copy** with the following to make the threshold decision reviewable:
+## Reading the results
 
-```kusto
-| project TimeGenerated, User, PreviousTime, PreviousIP, IPAddress,
-    PreviousLocation, Location, TimeDifferenceHours, DistanceKm, TravelSpeedKmh,
-    PreviousLatitude, PreviousLongitude, Latitude, Longitude,
-    Device, ManagedDevice, AuthenticationDetails
-```
+- **`User`, `DirectoryId`, `AccountObjectId`:** UPN and stable identity scope for the comparison. `User` contains the UPN, not a person's display name.
+- **`EventTime`, `PreviousTime`:** times used for travel calculations. `TimeGenerated` remains the later event's source timestamp for Sentinel.
+- **`DistanceKm`, `TimeDifferenceHours`, `TravelSpeedKmh`:** the values that explain why the pair matched.
+- **`PreviousIP`, `IPAddress`, `PreviousLocation`, `Location`:** both source addresses and country codes. Coordinates are returned separately.
+- **`PreviousDeviceDetail`, `DeviceDetail`:** complete device context for each event. The convenience `Device` fields contain OS names, not unique device identifiers.
+- **`PreviousAuthenticationDetails`, `AuthenticationDetails`:** both events' authentication-step details; inspect the actual step results.
+- **`PreviousSignInId`, `SignInId`, `PairId`:** event references and a stable identifier for this ordered pair. The hash is for correlation, not anonymisation.
+- **`PreviousIngestedAt`, `IngestedAt`:** explain freshness and help identify delayed ingestion.
 
-Keep the final `sort by TimeGenerated asc`. This is an optional display change; the downloadable query remains unchanged.
+A blank managed-device value means the field was unavailable; it does not prove an unmanaged device. A managed device, successful MFA or low risk score alone does not prove legitimate access.
 
 ## Analyst investigation workflow
 
-### 1. Confirm the triggering pair
+### 1. Validate the triggering pair
 
-Record the query version, UTC search window and the two source events in the case record. Confirm that both events belong to the same account, succeeded, and contain plausible coordinates. Recalculate the interval, distance and speed. Check for duplicated rows or concurrent sign-ins before treating the pair as a meaningful sequence.
+Record the query version, UTC search window, pair ID and underlying events. Check the account object IDs, success status, source addresses, coordinate plausibility and calculation. Review duplicate or concurrent sign-ins and establish whether one event arrived late.
 
-Expand the investigation beyond successful events. Failed attempts before or around the pair may add context that the detection deliberately excludes.
+The detection filters out failures. Retrieve failed and successful attempts around the pair to understand the broader authentication sequence.
 
-### 2. Reconstruct the sign-in timeline
+### 2. Reconstruct the timeline
 
-Use this supporting query with a case-specific UTC interval and account value. The values below are synthetic placeholders; replace them locally and keep real identifiers out of the public repository.
+Use the account object ID and directory ID from the result with a case-specific UTC interval. Replace the empty identifiers locally; do not commit populated values or query exports to this public repository.
 
 ```kusto
-let StartTime = datetime(2026-01-01T00:00:00Z);
-let EndTime = datetime(2026-01-01T04:00:00Z);
-let Account = "analyst@example.invalid";
+let StartTime = datetime(2026-01-01T00:00:00Z); // Replace locally.
+let EndTime = datetime(2026-01-01T04:00:00Z);   // Exclusive end.
+let Directory = "";                          // AADTenantId from result.
+let AccountId = "";                          // AccountObjectId from result.
 SigninLogs
+| where isnotempty(Directory) and isnotempty(AccountId)
 | where TimeGenerated >= StartTime and TimeGenerated < EndTime
-| where UserPrincipalName =~ Account
-| project TimeGenerated, CreatedDateTime, ResultType, ResultDescription,
-    IPAddress, Location, LocationDetails, AppDisplayName, ResourceDisplayName,
-    IsInteractive, DeviceDetail, ClientAppUsed, UserAgent,
-    AuthenticationDetails, ConditionalAccessStatus,
+| where AADTenantId == Directory and UserId == AccountId
+| project TimeGenerated, CreatedDateTime, Id, UserPrincipalName,
+    ResultType, ResultDescription, IPAddress, Location, LocationDetails,
+    AppDisplayName, ResourceDisplayName, IsInteractive, DeviceDetail,
+    ClientAppUsed, UserAgent, AuthenticationDetails, ConditionalAccessStatus,
     RiskLevelDuringSignIn, CorrelationId
-| sort by TimeGenerated asc
+| order by CreatedDateTime asc, TimeGenerated asc
 ```
 
-Review the earlier and later event together: device identifiers, operating system/browser, application, client, authentication steps, Conditional Access and available risk signals. A successful result or managed-device flag alone does not establish legitimacy. An MFA requirement alone does not establish that a fresh challenge was completed; inspect the authentication-step results and session context.
+Compare device identifiers, browser/OS, client, application, authentication methods, Conditional Access and available risk signals across both events. Distinguish a newly completed MFA challenge from authentication satisfied by an existing claim. Note missing telemetry explicitly.
 
-### 3. Investigate the network and user context
+### 3. Establish network and user context
 
-Determine whether each IP belongs to an approved corporate gateway, VPN provider, mobile carrier, hosting service or residential network. Check geolocation consistency and approved routing information. Use reputation findings as supporting evidence: a clean reputation is not proof of benign activity, and a shared VPN exit is not automatically malicious.
+Determine whether the addresses belong to corporate egress, VPN infrastructure, mobile carriers, hosting providers or residential networks. Compare approved routing records and location information. Reputation results provide context; a clean reputation is not a benign verdict.
 
-Confirm the user's activity through an established contact method. Ask about approved VPN use, travel, devices and application access. For MYDFIR testing, compare the pair against the authorised exercise timeline and VPN exit changes. Label that finding **authorised simulation**, not a real compromise.
+Confirm the user's activity through an established contact method. Check expected travel, approved VPN use, devices and applications. Assess whether the network, device and session evidence coherently explains the apparent movement.
 
-### 4. Look for corroborating activity
+### 4. Seek corroboration and assess impact
 
-Review related identity alerts and, where available, endpoint and application audit records around the same interval. Investigate unfamiliar sessions, new authentication methods, privilege changes, suspicious consent grants, mailbox changes or unusual resource access as appropriate to the account.
+Review related identity alerts and available endpoint/application audit records. Look for unrecognised sessions, changes to authentication methods, privilege changes, suspicious consent grants, mailbox changes or unusual resource access relevant to the account.
 
-Use additional telemetry to determine outcome: sign-in success alone does not demonstrate what data was accessed, whether persistence was established or whether information was exfiltrated. State any unavailable logs or retention gaps.
+Sign-in success alone does not establish downstream data access, persistence or exfiltration. Use the appropriate audit sources to determine those outcomes and document retention or visibility gaps.
 
-### 5. Document the decision and response
+### 5. Decide and respond
 
-| Disposition | Supporting basis | Next step |
+| Disposition | Evidence basis | Action |
 | --- | --- | --- |
-| Authorised simulation | Test timing and known VPN changes explain the pair | Record the simulated activity and the actual query result. |
-| Explained benign activity | User/device/network evidence coherently explains the change | Document the explanation; consider narrowly scoped tuning if the pattern recurs. |
-| Suspicious / inconclusive | Activity remains unexplained or evidence is incomplete | Escalate for further identity and endpoint investigation. |
-| Corroborated compromise | Additional evidence supports unauthorised account use | Follow the incident process for session revocation, credential reset, access restriction and wider scoping. |
+| Explained benign activity | Verified user, device and routing context explains the pair | Document the rationale; consider a narrowly scoped exception if warranted. |
+| Suspicious / inconclusive | Unexplained activity or incomplete evidence | Escalate and expand identity, endpoint and application investigation. |
+| Corroborated compromise | Additional evidence supports unauthorised account use | Follow the incident process for session revocation, credential reset, access restrictions and wider scoping. |
 
-Separate observed facts, interpretation and remaining uncertainty. A useful closure note answers **who, what, when, where and how**, then records the evidence supporting the disposition. Do not automatically block an account solely because this geographic threshold was met.
+Keep observed facts, interpretations and uncertainty separate. Record who, what, when, where and how, along with the evidence supporting the disposition. Do not automatically disable accounts solely on this geographic signal.
 
-## False positives and limitations
+## Microsoft Sentinel deployment
 
-- **VPNs, proxies and mobile routing:** source-IP geography can change while the user stays in one place. MYDFIR VPN simulations intentionally exercise this ambiguity.
-- **Geolocation quality:** coordinates can be approximate, stale, invalid or missing. The calculation measures IP-derived locations, not a device's verified position.
-- **Adjacent pairs only:** `prev()` compares each event with the preceding successful event for that account. Intervening events can change the pair and conceal other suspicious combinations.
-- **Missing coordinates affect pairing:** with the coordinate filter disabled, an unusable row can sit between two usable events. Enabling it before sorting skips such rows and changes which events are paired; test this deliberately.
-- **Time precision and ties:** the calculation uses second-based differences. Same-time or zero-second pairs are excluded, and tied timestamps have no additional ordering key. Very small intervals can produce extreme speeds.
-- **Account identity:** the query uses the UPN as supplied and does not exclude blank UPNs. Review missing identities and consider a validated stable identifier when adapting it for operational use.
-- **Table scope:** there is no explicit `IsInteractive` filter. The query processes successful rows available in `SigninLogs`; it does not union separate non-interactive, service-principal or managed-identity tables.
-- **Device context:** only the later event's OS and managed state are projected. Compare the complete earlier event before claiming device continuity or change.
-- **Query scope and scale:** the chosen time range affects pairing and cost. Sorting and serializing large datasets should be assessed in the target workspace.
+The query includes operational controls for scheduled evaluation. **Tenant execution and alert-delivery validation remain required before enablement.** No production performance or coverage results are asserted in this repository.
 
-## Tuning and operational use
+| Rule setting | Starting configuration |
+| --- | --- |
+| Type | Scheduled analytics rule |
+| Run every | 15 minutes, matching `RuleFrequency` |
+| Lookup data | 24 hours, matching `HistoryWindow` |
+| Trigger | Number of results greater than 0 |
+| Severity | Medium initially; adjust to the account and corroborating context |
+| Event grouping | Alert per result, subject to Sentinel's result/alert limits |
+| Account entity | `AadTenantId` → `DirectoryId`; `AadUserId` → `AccountObjectId` |
+| IP entities | Two IP mappings: Address → `PreviousIP`, Address → `IPAddress` |
+| Custom details | `PairId`, both sign-in IDs, distance, speed, interval and applications |
+| Incident grouping | Consider same-rule and same-account grouping; validate the actual grouping behaviour |
+| Automated containment | None by default |
 
-Retain 900 km/h and 200 km as the supplied starting thresholds. Assess labelled benign and simulated cases before changing them. Raising thresholds can reduce noise and also miss suspicious activity. Requiring different countries would remove same-country candidates.
+Account entity identifiers must refer to the Entra directory; `AADTenantId` is used rather than assuming the workspace `TenantId` is the directory ID.
 
-For recurring VPN noise, document the account, approved egress, reason, owner and expiry for any proposed exception. Avoid broad user, country or VPN-provider exclusions without reviewing the resulting coverage loss.
+### Freshness and repeated pairs
 
-This repository provides the query and analyst guidance, not a deployed analytics rule. Before scheduling it, define a bounded lookback that includes the predecessor event, review ingestion delay, map account/IP entities, and decide how to manage repeated pairs across overlapping runs. Validate these behaviours and establish an analyst response route before enabling alerts. The standalone query does not deduplicate alerts or automate containment.
+Freshness is applied **after** pairing. Applying a 15-minute filter before `prev()` would discard older predecessor events. Both ingestion timestamps are considered so an older event arriving after its successor can still produce a pair.
 
-## Evidence and validation status
+This is a stateless query. Reingestion, retries, schedule overlap or a changed event sequence can emit repeated or revised pairs. `PairId` supports downstream idempotency, but does not suppress duplicates by itself. Incident grouping is not alert deduplication. Missed runs longer than the freshness window need a controlled backfill; widen the freshness period in a separate recovery run and reconcile pair IDs against already processed alerts.
 
-The supplied query is preserved in [geographical_signin_detection.kql](geographical_signin_detection.kql). This write-up explains its logic and an investigation method. No raw tenant data, screenshots, measured performance or production outcomes are published here, and the query was not executed against a tenant during this repository update.
+### Enablement checks
 
-For a reproducible MYDFIR case, retain a sanitised before/after sign-in pair, query version, UTC window, VPN simulation timeline, calculated distance/speed, expected versus actual result and analyst disposition. Useful controls include a same-IP pair, a below-threshold pair, a different-user boundary and a missing-coordinate case. Publish only results that were actually observed.
+1. Confirm `SigninLogs` collection, required columns, non-null `ingestion_time()` and appropriate retention. Measure missing identities, coordinates and ingestion timestamps rather than treating absent results as healthy coverage.
+2. Execute the query in the target workspace, inspect both source events and measure runtime/resource use at representative volume. Large sorts and serialization need particular attention.
+3. Validate above/below-threshold cases, exact boundaries, same IP, different accounts/directories, missing/invalid coordinates, duplicate event IDs, equal timestamps and late arrival on either side. Check sign-in IDs and entity mappings in generated alerts.
+4. Observe alert volume, repeated pairs and analyst dispositions over an agreed pilot period. Agree a noise budget, ownership and escalation route before broader enablement.
+5. Monitor rule failures, source freshness and ingestion delay. Keep a reviewed rollback version and record any coverage gap during changes.
 
-Remove tenant and user identifiers, source IPs, device/session IDs and sensitive URLs from any public evidence. Keep original records privately and label illustrative values separately from observed results.
+For a historical replay, fix `EvaluationTime` to the intended run time and ensure the query interface covers the corresponding history window. To investigate old pairs independently of their ingestion time, remove the freshness stage in a separate working copy. Do not silently deploy that historical variant as the scheduled rule.
+
+## Tuning and coverage limits
+
+- **IP geolocation is approximate.** VPNs, proxies, carrier routing and stale location data can create benign matches. Latitude/longitude validity does not establish accuracy; `(0,0)` can be a source placeholder and needs data-quality review.
+- **Interactive scope is intentional.** Separate non-interactive and workload identity tables are not queried. Turning off `InteractiveOnly` only changes the filter within `SigninLogs`.
+- **Adjacent-pair coverage is limited.** Intervening valid events may hide other suspicious combinations. Same-IP activity, missing identifiers/coordinates, zero-time pairs and activity beyond the configured windows do not qualify.
+- **Late data has bounds.** Records outside either 24-hour bound are omitted. A late arrival can also change which events are neighbours; the query does not retract earlier alerts.
+- **Thresholds are configurable.** Raising them can reduce noise and miss relevant activity. Requiring different countries would exclude same-country impossible-travel candidates.
+- **Exceptions need ownership.** Review account/egress-specific evidence, expiry and coverage loss. Avoid blanket country, VPN-provider or managed-device exclusions.
+- **This is custom logic.** It is not the Microsoft Entra ID Protection impossible-travel risk algorithm and does not reproduce its baselines or suppression mechanisms.
+
+## Evidence and maintenance
+
+Retain dated query versions, a sanitised event pair, the UTC interval, calculated distance/speed, expected versus actual behaviour and analyst disposition for reviewed cases. Link any future performance claims to a defined observation period, reviewed sample and supporting records.
+
+Keep tenant/user identifiers, source addresses, device/session IDs and sensitive URLs out of public evidence. Store original records privately. Public screenshots should be irreversibly redacted and clearly distinguish illustrative values from observed results.
 
 ## References
 
 - [Microsoft: SigninLogs schema](https://learn.microsoft.com/en-us/azure/azure-monitor/reference/tables/signinlogs)
+- [Microsoft: geo_distance_2points()](https://learn.microsoft.com/en-us/kusto/query/geo-distance-2points-function)
 - [Microsoft: prev()](https://learn.microsoft.com/en-us/kusto/query/prev-function)
 - [Microsoft: serialize operator](https://learn.microsoft.com/en-us/kusto/query/serialize-operator)
-- [Microsoft: datetime_diff()](https://learn.microsoft.com/en-us/kusto/query/datetime-diff-function)
-- [Microsoft: geo_distance_2points()](https://learn.microsoft.com/en-us/kusto/query/geo-distance-2points-function)
+- [Microsoft: ingestion delay in scheduled analytics](https://learn.microsoft.com/en-us/azure/sentinel/ingestion-delay)
+- [Microsoft: scheduled analytics rules](https://learn.microsoft.com/en-us/azure/sentinel/scheduled-rules-overview)
 
 ## Repository contents
 
 ```text
-README.md                             Query explanation and analyst investigation guide
-geographical_signin_detection.kql     Original supplied detection query
+README.md                  Detection explanation, investigation and deployment guide
+impossible_travel.kql       Configurable impossible-travel detection query
 ```

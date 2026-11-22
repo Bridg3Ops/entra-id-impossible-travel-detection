@@ -1,0 +1,73 @@
+// Microsoft Entra ID - Impossible Travel Detection
+// Sentinel scheduled analytics: every 15m, lookup period 24h, threshold > 0.
+// Validate schema, ingestion latency, volume and alert mapping before enabling.
+let EvaluationTime = now();
+let RuleFrequency = 15m;
+let HistoryWindow = 24h;
+let MaxPairGap = 12h;
+let MinimumDistanceKm = 200.0;
+let MinimumSpeedKmh = 900.0;
+let InteractiveOnly = true;
+SigninLogs
+| where TimeGenerated >= EvaluationTime - HistoryWindow and TimeGenerated <= EvaluationTime
+| where ResultType == "0"
+| where InteractiveOnly == false or IsInteractive == true
+| extend IngestedAt = ingestion_time(),
+    EventTime = coalesce(CreatedDateTime, TimeGenerated),
+    DirectoryId = tostring(AADTenantId),
+    AccountObjectId = tostring(UserId),
+    SignInId = tostring(Id),
+    User = tolower(UserPrincipalName),
+    Latitude = todouble(LocationDetails.geoCoordinates.latitude),
+    Longitude = todouble(LocationDetails.geoCoordinates.longitude)
+| where isnotempty(DirectoryId) and isnotempty(AccountObjectId)
+    and isnotempty(SignInId) and isnotempty(IPAddress)
+| where isnotnull(IngestedAt) and IngestedAt <= EvaluationTime
+| where EventTime >= EvaluationTime - HistoryWindow and EventTime <= EvaluationTime
+| where Latitude between (-90.0 .. 90.0) and Longitude between (-180.0 .. 180.0)
+// Collapse repeated records for the same sign-in using the latest ingested row.
+| summarize arg_max(IngestedAt, *) by DirectoryId, AccountObjectId, SignInId
+| project TimeGenerated, EventTime, IngestedAt, DirectoryId, AccountObjectId, SignInId,
+    User, IPAddress, Location, Latitude, Longitude, DeviceDetail,
+    AppDisplayName, AuthenticationDetails, ConditionalAccessStatus,
+    RiskLevelDuringSignIn, IsInteractive
+| sort by DirectoryId asc, AccountObjectId asc, EventTime asc, SignInId asc
+| serialize
+| extend PreviousDirectoryId = prev(DirectoryId),
+    PreviousAccountObjectId = prev(AccountObjectId),
+    PreviousSignInId = prev(SignInId),
+    PreviousTime = prev(EventTime),
+    PreviousIngestedAt = prev(IngestedAt),
+    PreviousIP = prev(IPAddress),
+    PreviousLocation = prev(Location),
+    PreviousLatitude = prev(Latitude),
+    PreviousLongitude = prev(Longitude),
+    PreviousDeviceDetail = prev(DeviceDetail),
+    PreviousApplication = prev(AppDisplayName),
+    PreviousAuthenticationDetails = prev(AuthenticationDetails)
+| where DirectoryId == PreviousDirectoryId and AccountObjectId == PreviousAccountObjectId
+// Apply freshness AFTER pairing, so older predecessor rows remain available.
+// Either side may arrive late; overlapping runs and reingestion can repeat pairs.
+| where (IngestedAt > EvaluationTime - RuleFrequency and IngestedAt <= EvaluationTime)
+    or (PreviousIngestedAt > EvaluationTime - RuleFrequency and PreviousIngestedAt <= EvaluationTime)
+| extend TimeDifference = EventTime - PreviousTime
+| where TimeDifference > 0s and TimeDifference <= MaxPairGap
+| extend TimeDifferenceHours = TimeDifference / 1h
+| extend DistanceKm = geo_distance_2points(PreviousLongitude, PreviousLatitude, Longitude, Latitude) / 1000.0
+| extend TravelSpeedKmh = DistanceKm / TimeDifferenceHours
+| where PreviousIP != IPAddress
+| where TravelSpeedKmh > MinimumSpeedKmh and DistanceKm >= MinimumDistanceKm
+| extend PairId = hash_sha256(strcat(DirectoryId, "|", AccountObjectId, "|", PreviousSignInId, "|", SignInId)),
+    Device = tostring(DeviceDetail.operatingSystem),
+    ManagedDevice = tostring(DeviceDetail.isManaged),
+    PreviousDevice = tostring(PreviousDeviceDetail.operatingSystem),
+    PreviousManagedDevice = tostring(PreviousDeviceDetail.isManaged)
+| project TimeGenerated, EventTime, User, DirectoryId, AccountObjectId, PairId,
+    PreviousTime, TimeDifferenceHours, DistanceKm, TravelSpeedKmh,
+    PreviousSignInId, SignInId, PreviousIP, IPAddress, PreviousLocation, Location,
+    PreviousLatitude, PreviousLongitude, Latitude, Longitude,
+    PreviousDevice, Device, PreviousManagedDevice, ManagedDevice,
+    PreviousDeviceDetail, DeviceDetail, PreviousApplication, AppDisplayName,
+    PreviousAuthenticationDetails, AuthenticationDetails, ConditionalAccessStatus,
+    RiskLevelDuringSignIn, IsInteractive, PreviousIngestedAt, IngestedAt
+| sort by EventTime asc
